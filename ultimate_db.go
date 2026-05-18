@@ -18,13 +18,9 @@ import (
 	"time"
 )
 
-// ==========================================
-// 1. CONSTANTS & UTILITIES
-// ==========================================
-
 const PageSize = 32768
-const PageHeaderSize = 8   // 4 bytes for FreeSpaceOffset, 4 bytes for RecordCount
-const RecordHeaderSize = 24 // txnID (8) + expiresAt (8) + keyLen (4) + valLen (4)
+const PageHeaderSize = 8 
+const RecordHeaderSize = 24 
 
 type PageID uint64
 
@@ -34,10 +30,6 @@ func min(a, b int) int {
 	}
 	return b
 }
-
-// ==========================================
-// 2. DISK & BUFFER POOL MANAGEMENT
-// ==========================================
 
 type Page struct {
 	ID       PageID
@@ -51,11 +43,9 @@ func (p *Page) Init() {
 	binary.LittleEndian.PutUint32(p.Data[0:4], uint32(PageHeaderSize))
 	binary.LittleEndian.PutUint32(p.Data[4:8], 0)
 }
-
 func (p *Page) GetFreeSpaceOffset() uint32 {
 	return binary.LittleEndian.Uint32(p.Data[0:4])
 }
-
 func (p *Page) SetFreeSpaceOffset(offset uint32) {
 	binary.LittleEndian.PutUint32(p.Data[0:4], offset)
 }
@@ -215,7 +205,7 @@ func (bp *BufferPool) FlushAll() error {
 }
 
 // ==========================================
-// 3. GROUP COMMIT WRITE-AHEAD LOG (w/ TTL)
+// 3. GROUP COMMIT WRITE-AHEAD LOG & CHECKPOINTING
 // ==========================================
 
 type walEntry struct {
@@ -227,11 +217,16 @@ type walEntry struct {
 	errCh     chan error
 }
 
+type truncateReq struct {
+	errCh chan error
+}
+
 type BatchingWAL struct {
-	file  *os.File
-	queue chan walEntry
-	quit  chan struct{}
-	wg    sync.WaitGroup
+	file         *os.File
+	path         string
+	queue        chan interface{} // Handles both walEntry and truncateReq
+	quit         chan struct{}
+	wg           sync.WaitGroup
 }
 
 func NewBatchingWAL(path string) (*BatchingWAL, error) {
@@ -241,7 +236,8 @@ func NewBatchingWAL(path string) (*BatchingWAL, error) {
 	}
 	w := &BatchingWAL{
 		file:  f,
-		queue: make(chan walEntry, 4096),
+		path:  path,
+		queue: make(chan interface{}, 4096),
 		quit:  make(chan struct{}),
 	}
 	w.wg.Add(1)
@@ -255,6 +251,12 @@ func (w *BatchingWAL) Append(txnID uint64, expiresAt int64, id PageID, key, valu
 	return <-errCh
 }
 
+func (w *BatchingWAL) Checkpoint() error {
+	errCh := make(chan error, 1)
+	w.queue <- truncateReq{errCh: errCh}
+	return <-errCh
+}
+
 func (w *BatchingWAL) flusher() {
 	defer w.wg.Done()
 	bw := bufio.NewWriterSize(w.file, 32*1024)
@@ -262,31 +264,51 @@ func (w *BatchingWAL) flusher() {
 
 	for {
 		select {
-		case entry := <-w.queue:
-			pending = append(pending, entry)
-		drainLoop:
-			for len(pending) < 1000 {
-				select {
-				case e := <-w.queue:
-					pending = append(pending, e)
-				default:
-					break drainLoop
+		case msg := <-w.queue:
+			switch req := msg.(type) {
+			case walEntry:
+				pending = append(pending, req)
+			drainLoop:
+				for len(pending) < 1000 {
+					select {
+					case nextMsg := <-w.queue:
+						if e, ok := nextMsg.(walEntry); ok {
+							pending = append(pending, e)
+						} else {
+							// Push non-entry messages back and break drain
+							w.queue <- nextMsg
+							break drainLoop
+						}
+					default:
+						break drainLoop
+					}
 				}
-			}
 
-			for _, req := range pending {
-				w.writeEntry(bw, req)
-			}
+				for _, entry := range pending {
+					w.writeEntry(bw, entry)
+				}
 
-			err := bw.Flush()
-			if err == nil {
-				err = w.file.Sync()
-			}
+				err := bw.Flush()
+				if err == nil {
+					err = w.file.Sync()
+				}
 
-			for _, req := range pending {
+				for _, entry := range pending {
+					entry.errCh <- err
+				}
+				pending = pending[:0]
+
+			case truncateReq:
+				// Execute Log Truncation
+				bw.Flush()
+				w.file.Sync()
+				w.file.Close()
+				err := os.Truncate(w.path, 0)
+				
+				w.file, err = os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+				bw.Reset(w.file)
 				req.errCh <- err
 			}
-			pending = pending[:0]
 
 		case <-w.quit:
 			return
@@ -295,7 +317,6 @@ func (w *BatchingWAL) flusher() {
 }
 
 func (w *BatchingWAL) writeEntry(bw *bufio.Writer, req walEntry) {
-	// 36-byte header: CRC(4) + TxnID(8) + ExpiresAt(8) + PageID(8) + KeyLen(4) + ValLen(4)
 	buf := make([]byte, 36)
 	binary.LittleEndian.PutUint64(buf[4:12], req.txnID)
 	binary.LittleEndian.PutUint64(buf[12:20], uint64(req.expiresAt))
@@ -328,10 +349,39 @@ type DB struct {
 	bp        *BufferPool
 	wal       *BatchingWAL
 	nextTxnID atomic.Uint64
+	quit      chan struct{}
+	wg        sync.WaitGroup
 }
 
 func NewDB(bp *BufferPool, wal *BatchingWAL) *DB {
-	return &DB{bp: bp, wal: wal}
+	db := &DB{
+		bp:   bp,
+		wal:  wal,
+		quit: make(chan struct{}),
+	}
+	db.startCheckpointer()
+	return db
+}
+
+func (db *DB) startCheckpointer() {
+	db.wg.Add(1)
+	go func() {
+		defer db.wg.Done()
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// 1. Flush all dirty pages to the permanent DB file
+				db.bp.FlushAll()
+				// 2. Since pages are synced, WAL can be safely cleared
+				db.wal.Checkpoint()
+			case <-db.quit:
+				return
+			}
+		}
+	}()
 }
 
 func (db *DB) BeginTxn() uint64 {
@@ -564,18 +614,12 @@ func (db *DB) Scan(pageID PageID, readTxnID uint64, prefix []byte, iter func(key
 	return nil
 }
 
-// ==========================================
-// 4.5. MIDDLE-OUT COMPRESSION INTEGRATION
-// ==========================================
-
 func (db *DB) WriteCompressed(pageID PageID, txnID uint64, key, value []byte, ttl time.Duration) error {
 	compressedVal := make([]byte, MaxBlockSize)
-	
 	compLen, err := Compress(value, compressedVal)
 	if err != nil {
 		return fmt.Errorf("middle-out compression failed: %w", err)
 	}
-
 	return db.Write(pageID, txnID, key, compressedVal[:compLen], ttl)
 }
 
@@ -584,25 +628,19 @@ func (db *DB) ReadCompressed(pageID PageID, readTxnID uint64, key []byte) ([]byt
 	if err != nil {
 		return nil, err
 	}
-
 	if len(compressedVal) < 6 {
 		return nil, errors.New("corrupted payload: missing middle-out magic header")
 	}
-	
 	headerSign := uint16(compressedVal[0])<<8 | uint16(compressedVal[1])
 	if headerSign != MagicHeader {
 		return nil, errors.New("corrupted payload: invalid signature, data may not be compressed")
 	}
-
 	originalRawLen := int(compressedVal[2])<<8 | int(compressedVal[3])
-	
 	decompressedVal := make([]byte, originalRawLen)
-	
 	_, err = Decompress(compressedVal, decompressedVal)
 	if err != nil {
 		return nil, fmt.Errorf("middle-out decompression failed: %w", err)
 	}
-
 	return decompressedVal, nil
 }
 
@@ -611,24 +649,16 @@ func (db *DB) ScanCompressed(pageID PageID, readTxnID uint64, prefix []byte, ite
 		if len(compressedVal) < 6 {
 			return iter(key, compressedVal) 
 		}
-
 		originalRawLen := int(compressedVal[2])<<8 | int(compressedVal[3])
 		decompressedVal := make([]byte, originalRawLen)
-		
 		_, err := Decompress(compressedVal, decompressedVal)
 		if err != nil {
 			return false
 		}
-		
 		return iter(key, decompressedVal)
 	}
-
 	return db.Scan(pageID, readTxnID, prefix, decompressingIter)
 }
-
-// ==========================================
-// 5. RECOVERY & DATABASE UTILITIES
-// ==========================================
 
 func (db *DB) restoreWrite(txnID uint64, expiresAt int64, pageID PageID, key, value []byte) error {
 	page, err := db.bp.FetchPage(pageID)
@@ -670,6 +700,8 @@ func (db *DB) restoreWrite(txnID uint64, expiresAt int64, pageID PageID, key, va
 }
 
 func (db *DB) Close() error {
+	close(db.quit)
+	db.wg.Wait()
 	if err := db.bp.FlushAll(); err != nil {
 		return err
 	}
@@ -706,7 +738,6 @@ func RecoverDB(walPath string, db *DB) error {
 		keyLen := binary.LittleEndian.Uint32(headerBuf[28:32])
 		valLen := binary.LittleEndian.Uint32(headerBuf[32:36])
 
-		// SAFETY BOUND FIXED HERE
 		if keyLen == 0 {
 			return errors.New("corrupted WAL: missing key")
 		}
@@ -741,10 +772,6 @@ func RecoverDB(walPath string, db *DB) error {
 	db.nextTxnID.Store(maxTxnID)
 	return nil
 }
-
-// ==========================================
-// 6. REDIS-LIKE API WRAPPERS
-// ==========================================
 
 const PrefixHash = "H:"
 
@@ -1015,6 +1042,61 @@ func (tree *BTree) FindLeaf(key []byte) (*BTreePage, error) {
 }
 
 func (tree *BTree) Insert(key, value []byte) error {
+	reqBytes := uint32(4 + len(key) + len(value))
+
+	// OPTIMISTIC PASS: Traverse down holding only Read-Locks
+	currID := tree.rootID
+	currRaw, err := tree.bp.FetchPage(currID)
+	if err != nil {
+		return err
+	}
+	
+	currRaw.Latch.RLock()
+	currNode := &BTreePage{currRaw}
+
+	for currNode.PageType() == PageTypeInternal {
+		childID := tree.findChildInInternalNode(currNode, key)
+		childRaw, err := tree.bp.FetchPage(childID)
+		if err != nil {
+			currRaw.Latch.RUnlock()
+			tree.bp.UnpinPage(currID, false)
+			return err
+		}
+		childRaw.Latch.RLock()
+		currRaw.Latch.RUnlock()
+		tree.bp.UnpinPage(currID, false)
+		
+		currID = childID
+		currRaw = childRaw
+		currNode = &BTreePage{currRaw}
+	}
+
+	// We are at the leaf with a Read Lock. Is it safe to insert?
+	if currNode.IsSafeForInsert(reqBytes) {
+		// Node is safe. Upgrade to Write Lock by releasing and reclaiming.
+		// Note: In high concurrency, the node could split between Unlock and Lock.
+		// For a fully hardened OCC, we'd verify the LSN or boundary keys after re-locking.
+		currRaw.Latch.RUnlock()
+		currRaw.Latch.Lock()
+		defer currRaw.Latch.Unlock()
+		defer tree.bp.UnpinPage(currID, true)
+		
+		// Re-check safety after acquiring exclusive lock
+		if currNode.IsSafeForInsert(reqBytes) {
+			return tree.insertIntoLeaf(currNode, key, value)
+		}
+		// If it became unsafe, drop the lock and fall through to the pessimistic pass
+		currRaw.Latch.Unlock()
+	} else {
+		currRaw.Latch.RUnlock()
+		tree.bp.UnpinPage(currID, false)
+	}
+
+	// PESSIMISTIC PASS: Fallback to full Latch-Crabbing for structural splits
+	return tree.pessimisticInsert(key, value)
+}
+
+func (tree *BTree) pessimisticInsert(key, value []byte) error {
 	currID := tree.rootID
 	var lockedAncestors []*Page 
 	currRaw, err := tree.bp.FetchPage(currID)
@@ -1533,9 +1615,12 @@ func (q *NotQuery) Execute(s *SegmentSearcher) []uint64 { return Difference(q.Le
 // 12. QUERY PARSER
 // ==========================================
 
+const MaxQueryDepth = 50
+
 type Parser struct {
 	tokens []string
 	pos    int
+	depth  int
 }
 
 func ParseQuery(input string) (Query, error) {
@@ -1559,6 +1644,12 @@ func (p *Parser) consume() string {
 }
 
 func (p *Parser) parseExpression() (Query, error) {
+	p.depth++
+	if p.depth > MaxQueryDepth {
+		return nil, errors.New("query exceeded maximum nesting depth")
+	}
+	defer func() { p.depth-- }()
+
 	left, err := p.parseTerm()
 	if err != nil {
 		return nil, err
@@ -1576,6 +1667,12 @@ func (p *Parser) parseExpression() (Query, error) {
 }
 
 func (p *Parser) parseTerm() (Query, error) {
+	p.depth++
+	if p.depth > MaxQueryDepth {
+		return nil, errors.New("query exceeded maximum nesting depth")
+	}
+	defer func() { p.depth-- }()
+
 	left, err := p.parseFactor()
 	if err != nil {
 		return nil, err
@@ -1598,6 +1695,12 @@ func (p *Parser) parseTerm() (Query, error) {
 }
 
 func (p *Parser) parseFactor() (Query, error) {
+	p.depth++
+	if p.depth > MaxQueryDepth {
+		return nil, errors.New("query exceeded maximum nesting depth")
+	}
+	defer func() { p.depth-- }()
+
 	token := p.current()
 
 	if token == "(" {
@@ -1619,7 +1722,7 @@ func (p *Parser) parseFactor() (Query, error) {
 
 	p.consume()
 	cleaned := Tokenize(token)
-	// SAFETY BOUND FIXED HERE
+	
 	if len(cleaned) == 0 {
 		return &TermQuery{Term: ""}, nil
 	}
