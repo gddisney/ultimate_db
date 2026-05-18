@@ -3,7 +3,16 @@ package ultimate_db
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
+
+// Reusable buffer pool to eliminate GC pressure during decompression
+var snappyDecodePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, MaxBlockSize*3+3)
+		return &b
+	},
+}
 
 // Decompress reverses the Middle-Out compression strategy (Entropy & LRE)
 func Decompress(src []byte, dst []byte) (int, error) {
@@ -23,9 +32,15 @@ func Decompress(src []byte, dst []byte) (int, error) {
 		return 0, fmt.Errorf("destination buffer too small: need %d bytes", origLen)
 	}
 
-	snappyPayload := make([]byte, snappyLen)
+	bufPtr := snappyDecodePool.Get().(*[]byte)
+	snappyBuffer := *bufPtr
+	defer snappyDecodePool.Put(bufPtr)
+	
+	if snappyLen > len(snappyBuffer) {
+		return 0, errors.New("corrupted payload size exceeds max block bounds")
+	}
+	snappyPayload := snappyBuffer[:snappyLen]
 
-	// Pass 2 Inverse: Bit-Unpacking using Forest Table and Overflow Tree
 	srcIdx := 6
 	snappyIdx := 0
 	var bitBuffer uint64 = 0
@@ -54,13 +69,11 @@ func Decompress(src []byte, dst []byte) (int, error) {
 		consumed := entry.Consumed()
 
 		if consumed > 0 && consumed <= LookaheadBits {
-			// Dense path hit
 			snappyPayload[snappyIdx] = entry.Literal()
 			snappyIdx++
 			bitCount -= consumed
 			bitBuffer &= (1 << bitCount) - 1
 		} else {
-			// Sparse path fallback
 			var currNode int16 = 0
 			var symbol byte
 			found := false
@@ -103,7 +116,6 @@ func Decompress(src []byte, dst []byte) (int, error) {
 		}
 	}
 
-	// Pass 1 Inverse: RLE & Escape Decoder
 	sIdx, dIdx := 0, 0
 	for sIdx < len(snappyPayload) {
 		if dIdx >= len(dst) {
