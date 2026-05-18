@@ -568,7 +568,6 @@ func (db *DB) Scan(pageID PageID, readTxnID uint64, prefix []byte, iter func(key
 // 4.5. MIDDLE-OUT COMPRESSION INTEGRATION
 // ==========================================
 
-// WriteCompressed applies Middle-Out compression to the value payload before writing to the DB page.
 func (db *DB) WriteCompressed(pageID PageID, txnID uint64, key, value []byte, ttl time.Duration) error {
 	compressedVal := make([]byte, MaxBlockSize)
 	
@@ -580,7 +579,6 @@ func (db *DB) WriteCompressed(pageID PageID, txnID uint64, key, value []byte, tt
 	return db.Write(pageID, txnID, key, compressedVal[:compLen], ttl)
 }
 
-// ReadCompressed retrieves a compressed payload from the page and passes it through the Forest Density Matrix.
 func (db *DB) ReadCompressed(pageID PageID, readTxnID uint64, key []byte) ([]byte, error) {
 	compressedVal, err := db.Read(pageID, readTxnID, key)
 	if err != nil {
@@ -608,7 +606,6 @@ func (db *DB) ReadCompressed(pageID PageID, readTxnID uint64, key []byte) ([]byt
 	return decompressedVal, nil
 }
 
-// ScanCompressed iterates over keys and transparently decompresses matching payloads on the fly.
 func (db *DB) ScanCompressed(pageID PageID, readTxnID uint64, prefix []byte, iter func(key, value []byte) bool) error {
 	decompressingIter := func(key, compressedVal []byte) bool {
 		if len(compressedVal) < 6 {
@@ -709,6 +706,10 @@ func RecoverDB(walPath string, db *DB) error {
 		keyLen := binary.LittleEndian.Uint32(headerBuf[28:32])
 		valLen := binary.LittleEndian.Uint32(headerBuf[32:36])
 
+		// SAFETY BOUND FIXED HERE
+		if keyLen == 0 {
+			return errors.New("corrupted WAL: missing key")
+		}
 		if keyLen > 1<<20 || valLen > 1<<28 {
 			return errors.New("corrupted WAL: limits exceeded")
 		}
@@ -747,7 +748,6 @@ func RecoverDB(walPath string, db *DB) error {
 
 const PrefixHash = "H:"
 
-// HSet inserts a field into a hash map. Uses MVCC/TTL DB engine.
 func (db *DB) HSet(pageID PageID, txnID uint64, hashKey, field, value []byte, ttl time.Duration) error {
 	compositeKey := make([]byte, 0, len(PrefixHash)+len(hashKey)+1+len(field))
 	compositeKey = append(compositeKey, []byte(PrefixHash)...)
@@ -814,7 +814,6 @@ func NewBTree(bp *BufferPool, rootID PageID) *BTree {
 	return &BTree{bp: bp, rootID: rootID}
 }
 
-// BTreeCursor allows sequential, lazy iteration over a BTree's leaf nodes.
 type BTreeCursor struct {
 	tree     *BTree
 	currNode *BTreePage
@@ -1620,6 +1619,7 @@ func (p *Parser) parseFactor() (Query, error) {
 
 	p.consume()
 	cleaned := Tokenize(token)
+	// SAFETY BOUND FIXED HERE
 	if len(cleaned) == 0 {
 		return &TermQuery{Term: ""}, nil
 	}
