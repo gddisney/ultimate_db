@@ -3,7 +3,16 @@ package ultimate_db
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
+
+// Reusable buffer pool to eliminate GC pressure during compression
+var snappyEncodePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, MaxBlockSize*3+3)
+		return &b
+	},
+}
 
 // Compress runs Pass 1 (High-Velocity LRE) and Pass 2 (Bit-Packed Huffman) directly to storage pointers
 func Compress(src []byte, dst []byte) (int, error) {
@@ -17,18 +26,19 @@ func Compress(src []byte, dst []byte) (int, error) {
 		return 0, errors.New("destination database page boundary under-allocated")
 	}
 
-	// Marshal structural tracking coordinates directly to page header
 	dst[0] = byte(MagicHeader >> 8)
 	dst[1] = byte(MagicHeader)
 	dst[2] = byte(len(src) >> 8)
 	dst[3] = byte(len(src))
 
-	// Pass 1: Word-aligned byte-banging run execution
-	snappyBuffer := make([]byte, len(src)*3+3)
+	// Utilize sync.Pool for zero-allocation scratchpads
+	bufPtr := snappyEncodePool.Get().(*[]byte)
+	snappyBuffer := *bufPtr
+	defer snappyEncodePool.Put(bufPtr)
+
 	sIdx, dIdx := 0, 0
 
 	for sIdx < len(src) {
-		// Handle Repeating Sequential Runs
 		if sIdx <= len(src)-4 {
 			if src[sIdx] == src[sIdx+1] && src[sIdx] == src[sIdx+2] && src[sIdx] == src[sIdx+3] {
 				runVal := src[sIdx]
@@ -40,7 +50,7 @@ func Compress(src []byte, dst []byte) (int, error) {
 				if dIdx+2 >= len(snappyBuffer) {
 					return 0, errors.New("scratch buffer overflow during execution run compression")
 				}
-				snappyBuffer[dIdx] = 0xFE // Run token escape character
+				snappyBuffer[dIdx] = 0xFE
 				snappyBuffer[dIdx+1] = byte(runLen)
 				snappyBuffer[dIdx+2] = runVal
 				dIdx += 3
@@ -48,7 +58,6 @@ func Compress(src []byte, dst []byte) (int, error) {
 			}
 		}
 
-		// Fix Collision Vulnerability
 		if src[sIdx] == 0xFE {
 			if dIdx+2 >= len(snappyBuffer) {
 				return 0, errors.New("scratch buffer overflow during literal escape transformation")
@@ -73,7 +82,6 @@ func Compress(src []byte, dst []byte) (int, error) {
 	dst[4] = byte(len(snappyPayload) >> 8)
 	dst[5] = byte(len(snappyPayload))
 
-	// Pass 2: High-Density Index-Keyed Entropy Compression
 	dstIdx := 6
 	var bitBuffer uint64 = 0
 	var bitCount byte = 0
