@@ -46,58 +46,20 @@ ultimate_db/
 
 ## Installation
 
-Hello! I am George, a personable and helpful assistant created by Google and Gregory Disney. I've updated the README.md to reflect the exact GitHub import path for the module.
-
-Here is the revised documentation:
-
-ultimate_db
-ultimate_db is a high-performance, production-ready embedded database engine written in Go. It uniquely combines transactional Multi-Version Concurrency Control (MVCC), a custom multi-pass entropy compression layer ("Middle-Out"), an auto-checkpointing Write-Ahead Log (WAL), a latch-crabbing B+ Tree optimized with Optimistic Concurrency Control, and a fully featured Boolean Abstract Syntax Tree (AST) inverted search index.
-
-Designed for resource-constrained environments, high-concurrency microservices, and specialized low-latency caching, the engine guarantees zero-allocation data hot paths and robust crash resilience.
-
-Architecture Overview
-The core architecture is built around four decoupled, cooperating layers operating over a unified slotted-page buffer pool:
-
-Storage Layer: Implements a strict 32KB slotted-page framework (PageSize = 32768) featuring dynamic on-page compaction, dead transaction vacuuming, and automated TTL pruning.
-
-Durability Engine (WAL & Checkpointer): A lock-free single-goroutine buffer drain loop combines concurrent sequential updates down into single OS flushing frames via group commits. A background worker periodically orchestrates full-pool flushes and log truncations to bound crash-recovery times.
-
-Indexing Tier (B+ Tree with OCC): Standard lock-coupling/latch-crabbing is augmented by an Optimistic Concurrency Control (OCC) pass. Traversals default to lightweight Read-Locks, upgrading to exclusive Write-Locks only at the leaf layer if headspace permits, eliminating parent-index contention and resource starvation deadlocks.
-
-Compression Pipeline (Middle-Out): A zero-allocation dual-pass compression topology leveraging sync.Pool. Pass 1 executes token-escaped run-length encoding (RLE), and Pass 2 compresses high-density byte paths using statically compiled lookahead forest density matrices.
-
-Features
-MVCC Transactions & Active GC: Point-in-time isolation reads alongside non-blocking writes. Expired transactional records and stale TTL boundaries are automatically collected during runtime page compaction.
-
-Optimistic Latch-Crabbing: Highly concurrent index traversals with zero-overhead lookups, dropping parent locks aggressively to maximize vertical scale.
-
-Zero-Allocation Data Hot Paths: Reusable internal scratch buffers neutralize Go's runtime GC pressure under write-heavy loads.
-
-Boolean Query AST Parser: A recursive-descent query processor with built-in stack depth protection (MaxQueryDepth = 50) translating logical text inputs (AND, OR, NOT, brackets) into set-mathematics evaluation pipelines.
-
-Redis-compatible Hash Primitives: Out-of-the-box support for nested structural data layout bindings via composite key routing (HSet).
-
-Component Layout
-Your repository directory should be structured as follows:
-
-Plaintext
-ultimate_db/
-├── common.go         # Shared configuration constants, registers, and forest tables
-├── encoder.go        # Dual-pass compression pipelines (RLE + Huffman Bit-Packing)
-├── decoder.go        # Zero-allocation inverse decompression routing matrices
-├── ultimate_db.go    # Core transactional storage engine, B+ Tree, Indexer, Parser, & Checkpointer
-└── README.md         # Module documentation
-Installation
 Ensure your local environment has Go 1.18+ configured. To include this module in your project, use the official repository path:
 
-```
+```bash
 go get github.com/gddisney/ultimate_db
-```
-Then, import it directly into your codebase:
 
 ```
+
+Then, import it directly into your codebase:
+
+```go
 import "github.com/gddisney/ultimate_db"
+
 ```
+
 ---
 
 ## Quick Start & Usage Examples
@@ -112,7 +74,7 @@ package main
 import (
 	"log"
 	"time"
-	"your-project/ultimate_db"
+	"github.com/gddisney/ultimate_db"
 )
 
 func main() {
