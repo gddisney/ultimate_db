@@ -2,7 +2,9 @@ package ultimate_db
 
 // Global Configuration Primitives
 const (
-	MaxBlockSize  = 32768                    // 32KB Dedicated Page Boundary
+	// Reduced from 32768 to 32700. 
+	// Leaves 68 bytes for the 8-byte Page Header, 24-byte Record Header, and 6-byte Magic Header.
+	MaxBlockSize  = 32700                    
 	MagicHeader   = 0x5348                   // "SH" Cryptographic Signature Mark
 	LookaheadBits = 8                        // Forest density bit window width
 	LookaheadMask = (1 << LookaheadBits) - 1 // 0xFF Mask for isolating bit windows
