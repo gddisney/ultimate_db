@@ -93,7 +93,7 @@ func Decompress(src []byte, dst []byte) (int, error) {
 
 				bit := byte((tempBitBuffer >> (tempBitCount - 1)) & 1)
 				tempBitCount--
-				bitCount--
+				// FIX: removed bitCount-- to prevent uint8 underflow
 
 				treeIdx := int(currNode) + int(bit)
 				nextNode := GlobalOverflowTree[treeIdx]
@@ -102,6 +102,7 @@ func Decompress(src []byte, dst []byte) (int, error) {
 					symbol = byte(^nextNode)
 					found = true
 					bitBuffer = tempBitBuffer & ((1 << tempBitCount) - 1)
+					bitCount = tempBitCount // FIX: Sync bitCount exactly here
 					break
 				}
 				currNode = nextNode
