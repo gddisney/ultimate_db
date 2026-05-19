@@ -27,7 +27,7 @@ func Compress(src []byte, dst []byte) (int, error) {
 	}
 
 	dst[0] = byte(MagicHeader >> 8)
-	dst[1] = byte(MagicHeader)
+	dst[1] = byte(MagicHeader & 0xFF)
 	dst[2] = byte(len(src) >> 8)
 	dst[3] = byte(len(src))
 
