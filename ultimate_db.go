@@ -19,8 +19,8 @@ import (
 )
 
 const PageSize = 32768
-const PageHeaderSize = 8 
-const RecordHeaderSize = 24 
+const PageHeaderSize = 8
+const RecordHeaderSize = 24
 
 type PageID uint64
 
@@ -32,11 +32,12 @@ func min(a, b int) int {
 }
 
 type Page struct {
-	ID       PageID
-	Data     [PageSize]byte
-	PinCount atomic.Int32
-	IsDirty  bool
-	Latch    sync.RWMutex
+	ID         PageID
+	Data       [PageSize]byte
+	PinCount   atomic.Int32
+	IsDirty    bool
+	Latch      sync.RWMutex
+	MemVersion uint64 // Added for OCC validation
 }
 
 func (p *Page) Init() {
@@ -52,7 +53,6 @@ func (p *Page) SetFreeSpaceOffset(offset uint32) {
 
 type DiskManager struct {
 	file *os.File
-	mu   sync.Mutex
 }
 
 func NewDiskManager(dbPath string) (*DiskManager, error) {
@@ -64,15 +64,11 @@ func NewDiskManager(dbPath string) (*DiskManager, error) {
 }
 
 func (d *DiskManager) ReadPage(id PageID, data *[PageSize]byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	_, err := d.file.ReadAt(data[:], int64(id)*PageSize)
 	return err
 }
 
 func (d *DiskManager) WritePage(id PageID, data *[PageSize]byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	_, err := d.file.WriteAt(data[:], int64(id)*PageSize)
 	return err
 }
@@ -191,17 +187,36 @@ func (bp *BufferPool) NewPage() (*Page, error) {
 
 func (bp *BufferPool) FlushAll() error {
 	bp.mu.Lock()
-	defer bp.mu.Unlock()
+	var dirtyPages []*Page
 
+	// 1. Gather and pin dirty pages fast to avoid blocking the pool
 	for _, page := range bp.frames {
 		if page.IsDirty {
-			if err := bp.disk.WritePage(page.ID, &page.Data); err != nil {
-				return err
-			}
-			page.IsDirty = false
+			page.PinCount.Add(1) // Pin it so eviction ignores it during flush
+			dirtyPages = append(dirtyPages, page)
 		}
 	}
-	return nil
+	bp.mu.Unlock() // Let the database continue working!
+
+	var firstErr error
+
+	// 2. Flush to disk without holding the global lock
+	for _, page := range dirtyPages {
+		page.Latch.RLock() // Prevent partial writes being flushed
+		err := bp.disk.WritePage(page.ID, &page.Data)
+		page.Latch.RUnlock()
+
+		bp.mu.Lock()
+		if err == nil {
+			page.IsDirty = false
+		} else if firstErr == nil {
+			firstErr = err
+		}
+		page.PinCount.Add(-1) // Unpin
+		bp.mu.Unlock()
+	}
+
+	return firstErr
 }
 
 // ==========================================
@@ -346,11 +361,12 @@ func (w *BatchingWAL) Close() error {
 // ==========================================
 
 type DB struct {
-	bp        *BufferPool
-	wal       *BatchingWAL
-	nextTxnID atomic.Uint64
-	quit      chan struct{}
-	wg        sync.WaitGroup
+	bp         *BufferPool
+	wal        *BatchingWAL
+	nextTxnID  atomic.Uint64
+	activeTxns sync.Map
+	quit       chan struct{}
+	wg         sync.WaitGroup
 }
 
 func NewDB(bp *BufferPool, wal *BatchingWAL) *DB {
@@ -385,7 +401,13 @@ func (db *DB) startCheckpointer() {
 }
 
 func (db *DB) BeginTxn() uint64 {
-	return db.nextTxnID.Add(1)
+	id := db.nextTxnID.Add(1)
+	db.activeTxns.Store(id, true) // Mark as active/uncommitted
+	return id
+}
+
+func (db *DB) CommitTxn(txnID uint64) {
+	db.activeTxns.Delete(txnID) // Mark as committed globally
 }
 
 func (db *DB) compactPage(page *Page) {
@@ -532,7 +554,11 @@ func (db *DB) Read(pageID PageID, readTxnID uint64, key []byte) ([]byte, error) 
 		recordKey := recordSlice[24 : 24+keyLen]
 		recordVal := recordSlice[24+keyLen : 24+keyLen+valLen]
 
-		if string(recordKey) == string(key) && recordTxnID <= readTxnID && recordTxnID >= highestTxnID {
+		// ISOLATION CHECK: Is this record committed, or is it our own uncommitted write?
+		_, isActive := db.activeTxns.Load(recordTxnID)
+		isCommitted := !isActive || recordTxnID == readTxnID
+
+		if string(recordKey) == string(key) && recordTxnID <= readTxnID && recordTxnID >= highestTxnID && isCommitted {
 			if expiresAt > now {
 				highestTxnID = recordTxnID
 				latestValue = make([]byte, valLen)
@@ -586,7 +612,11 @@ func (db *DB) Scan(pageID PageID, readTxnID uint64, prefix []byte, iter func(key
 		recordKey := recordSlice[24 : 24+keyLen]
 		recordVal := recordSlice[24+keyLen : 24+keyLen+valLen]
 
-		if bytes.HasPrefix(recordKey, prefix) && recordTxnID <= readTxnID {
+		// ISOLATION CHECK: Is this record committed, or is it our own uncommitted write?
+		_, isActive := db.activeTxns.Load(recordTxnID)
+		isCommitted := !isActive || recordTxnID == readTxnID
+
+		if bytes.HasPrefix(recordKey, prefix) && recordTxnID <= readTxnID && isCommitted {
 			existing, exists := latest[string(recordKey)]
 			
 			if !exists || recordTxnID >= existing.txnID {
@@ -1073,24 +1103,32 @@ func (tree *BTree) Insert(key, value []byte) error {
 
 	// We are at the leaf with a Read Lock. Is it safe to insert?
 	if currNode.IsSafeForInsert(reqBytes) {
-		// Node is safe. Upgrade to Write Lock by releasing and reclaiming.
-		// Note: In high concurrency, the node could split between Unlock and Lock.
-		// For a fully hardened OCC, we'd verify the LSN or boundary keys after re-locking.
+		// Capture version before releasing the Read Lock
+		version := currRaw.MemVersion 
+
 		currRaw.Latch.RUnlock()
 		currRaw.Latch.Lock()
-		defer currRaw.Latch.Unlock()
-		defer tree.bp.UnpinPage(currID, true)
-		
-		// Re-check safety after acquiring exclusive lock
-		if currNode.IsSafeForInsert(reqBytes) {
-			return tree.insertIntoLeaf(currNode, key, value)
+
+		// OCC VALIDATION: Did another thread mutate this node while we escalated?
+		if currRaw.MemVersion != version {
+			currRaw.Latch.Unlock()
+			tree.bp.UnpinPage(currID, false)
+			return tree.pessimisticInsert(key, value) // Fallback safely
 		}
-		// If it became unsafe, drop the lock and fall through to the pessimistic pass
+
+		if currNode.IsSafeForInsert(reqBytes) {
+			err := tree.insertIntoLeaf(currNode, key, value)
+			currRaw.Latch.Unlock()
+			tree.bp.UnpinPage(currID, true)
+			return err
+		}
+
 		currRaw.Latch.Unlock()
 	} else {
 		currRaw.Latch.RUnlock()
-		tree.bp.UnpinPage(currID, false)
 	}
+
+	tree.bp.UnpinPage(currID, false)
 
 	// PESSIMISTIC PASS: Fallback to full Latch-Crabbing for structural splits
 	return tree.pessimisticInsert(key, value)
@@ -1195,6 +1233,9 @@ func (tree *BTree) SplitLeaf(node *BTreePage, lockedAncestors []*Page) error {
 		node.Data[i] = 0
 	}
 
+	node.MemVersion++
+	newLeaf.MemVersion++
+
 	return tree.promoteToParent(node.ID, newLeaf.ID, midKey, lockedAncestors)
 }
 
@@ -1245,6 +1286,9 @@ func (tree *BTree) SplitInternalNode(node *BTreePage, lockedAncestors []*Page) e
 		node.Data[i] = 0
 	}
 
+	node.MemVersion++
+	newInternal.MemVersion++
+
 	return tree.promoteToParent(node.ID, newInternal.ID, pivotKey, lockedAncestors)
 }
 
@@ -1269,6 +1313,7 @@ func (tree *BTree) promoteToParent(leftChildID, rightChildID PageID, pivotKey []
 		copy(newRoot.Data[offset+10:], pivotKey)
 
 		newRoot.SetRightmostChildID(rightChildID)
+		newRoot.MemVersion++
 		tree.rootID = newRoot.ID
 		return nil
 	}
@@ -1345,6 +1390,7 @@ func (tree *BTree) insertIntoLeaf(node *BTreePage, newKey, newVal []byte) error 
 	copy(node.Data[valStart:valStart+uint32(len(newVal))], newVal)
 
 	node.SetNumCells(numCells + 1)
+	node.MemVersion++
 	return nil
 }
 
@@ -1385,6 +1431,7 @@ func (tree *BTree) insertIntoInternal(node *BTreePage, pivotKey []byte, leftChil
 	copy(node.Data[insertOffset+10 : insertOffset+10+uint32(len(pivotKey))], pivotKey)
 
 	node.SetNumCells(numCells + 1)
+	node.MemVersion++
 	return nil
 }
 
