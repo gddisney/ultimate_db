@@ -187,16 +187,6 @@ log.Printf("Matching Document IDs: %v", results) // Yields matching arrays linea
 
 ```
 
----
-
-## Production Security & Safety Considerations
-
-* **Lock Escalation Resiliency:** While the engine applies Optimistic Concurrency Control loops to scale read workloads, lock-upgrades are non-atomic in native Go sync maps. High-contention collisions trigger automated internal rollbacks to pessimistic latch-crabbing modes gracefully.
-* **Parser Boundaries:** The text translation stack drops processing evaluations if deep nesting attempts to exceed `MaxQueryDepth = 50`. Do not modify this limit without verifying operating system stack configurations.
-* **Log Rotation:** The continuous background checkpointer loop targets automated cleanups every 5 minutes by default. For micro-burst environments, adjust the ticker speed within `startCheckpointer()` inside `ultimate_db.go` to match available underlying physical hardware I/O constraints.
-
----
-
 ## License
 
 This project is licensed under the MIT License - see the `LICENSE` file for details.
