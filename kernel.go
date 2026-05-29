@@ -6,10 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Internal Registry Reservations
@@ -21,23 +22,55 @@ const (
 )
 
 // -----------------------------------------------------------------------------
-// Core Interfaces (Breaking the Circular Dependency)
+// Core Interfaces (Breaking the Circular Dependency Loops)
 // -----------------------------------------------------------------------------
 
-// NetworkTransport abstracts the peer-to-peer overlay plane
 type NetworkTransport interface {
 	BroadcastQuery(ctx context.Context, queryPayload []byte) ([][]byte, error)
 	GetLocalNodeID() string
 }
 
-// AuditInterceptor abstracts inline permission and logging checks
 type AuditInterceptor interface {
 	VerifyAccess(subject []byte, action, resource string) bool
 	LogAudit(actor, action, msg string)
 }
 
 // -----------------------------------------------------------------------------
-// Inverted Index Models
+// Core Tokenizer Subsystem
+// -----------------------------------------------------------------------------
+
+type InternalAnalyzer struct {
+	stopWords map[string]bool
+}
+
+func NewInternalAnalyzer() *InternalAnalyzer {
+	return &InternalAnalyzer{
+		stopWords: map[string]bool{
+			"the": true, "is": true, "at": true, "which": true, "on": true,
+			"and": true, "a": true, "an": true, "in": true, "of": true,
+			"to": true, "for": true, "with": true, "by": true, "as": true,
+		},
+	}
+}
+
+func (a *InternalAnalyzer) Tokenize(text string) []string {
+	f := func(c rune) bool {
+		return !unicode.IsLetter(c) && !unicode.IsNumber(c)
+	}
+	rawTokens := strings.FieldsFunc(text, f)
+	tokens := make([]string, 0, len(rawTokens))
+	
+	for _, t := range rawTokens {
+		clean := strings.ToLower(t)
+		if !a.stopWords[clean] && len(clean) > 1 {
+			tokens = append(tokens, clean)
+		}
+	}
+	return tokens
+}
+
+// -----------------------------------------------------------------------------
+// Data Transmission Structures
 // -----------------------------------------------------------------------------
 
 type Posting struct {
@@ -72,27 +105,20 @@ type RoutingEntry struct {
 	Healthy bool
 }
 
-// -----------------------------------------------------------------------------
-// Integrated Engine Handler
-// -----------------------------------------------------------------------------
-
 type IntegratedEngine struct {
 	DB          *DB
-	Transport   NetworkTransport // Injected P2P capabilities
-	Interceptor AuditInterceptor // Injected PBAC/ABAC guardrails
+	Transport   NetworkTransport
+	Interceptor AuditInterceptor
 	Analyzer    *InternalAnalyzer
+	Scorer      *BM25Scorer
 
-	// Sharding State
 	vNodes       int
 	ring         []uint32
 	nodeMap      map[uint32]string
 	routingTable map[string]*RoutingEntry
 
-	// Metrics
 	TotalDocs int
 	AvgDocLen float64
-	k1        float64
-	b         float64
 	mu        sync.RWMutex
 }
 
@@ -102,14 +128,12 @@ func NewIntegratedEngine(db *DB, transport NetworkTransport, interceptor AuditIn
 		Transport:    transport,
 		Interceptor:  interceptor,
 		Analyzer:     NewInternalAnalyzer(),
+		Scorer:       NewBM25Scorer(),
 		vNodes:       DefaultVirtualNodes,
 		nodeMap:      make(map[uint32]string),
 		routingTable: make(map[string]*RoutingEntry),
-		k1:           1.2,
-		b:            0.75,
 	}
 
-	// Recover engine state from page frames
 	txn := db.BeginTxn()
 	stateBytes, err := db.Read(MetadataPageID, txn, []byte("bm25_state"))
 	db.CommitTxn(txn)
@@ -125,7 +149,6 @@ func NewIntegratedEngine(db *DB, transport NetworkTransport, interceptor AuditIn
 	return ie, nil
 }
 
-// AddClusterNode maps network coordinates onto the internal hash ring
 func (ie *IntegratedEngine) AddClusterNode(nodeID, address string) {
 	ie.mu.Lock()
 	defer ie.mu.Unlock()
@@ -145,6 +168,86 @@ func (ie *IntegratedEngine) AddClusterNode(nodeID, address string) {
 		ie.nodeMap[hk] = nodeID
 	}
 	sort.Slice(ie.ring, func(i, j int) bool { return ie.ring[i] < ie.ring[j] })
+}
+
+// InsertDocument runs a single-pass transaction, writing data blocks and updating index chunks simultaneously
+func (ie *IntegratedEngine) InsertDocument(pageID PageID, docID string, text string) error {
+	tokens := ie.Analyzer.Tokenize(text)
+	termCounts := make(map[string]int)
+	for _, token := range tokens {
+		termCounts[token]++
+	}
+
+	txn := ie.DB.BeginTxn()
+	defer ie.DB.CommitTxn(txn)
+
+	docKey := []byte(fmt.Sprintf("doc:%s", docID))
+	if err := ie.DB.Write(pageID, txn, docKey, []byte(text), 0); err != nil {
+		return err
+	}
+
+	for term, count := range termCounts {
+		metaKey := []byte(fmt.Sprintf("term_meta:%s", term))
+		var chunkCount uint32 = 0
+		
+		metaBytes, err := ie.DB.Read(IndexPageID, txn, metaKey)
+		if err == nil && len(metaBytes) > 0 {
+			chunkCount = binary.BigEndian.Uint32(metaBytes)
+		}
+
+		if chunkCount == 0 {
+			chunkCount = 1
+			var buf [4]byte
+			binary.BigEndian.PutUint32(buf[:], chunkCount)
+			_ = ie.DB.Write(IndexPageID, txn, metaKey, buf[:], 0)
+		}
+
+		targetChunkKey := []byte(fmt.Sprintf("term:%s:chunk:%d", term, chunkCount-1))
+		var currentChunk PostingsChunk
+		
+		chunkBytes, err := ie.DB.Read(IndexPageID, txn, targetChunkKey)
+		if err == nil && len(chunkBytes) > 0 {
+			_ = json.Unmarshal(chunkBytes, &currentChunk)
+		} else {
+			currentChunk = PostingsChunk{
+				ChunkID:  chunkCount - 1,
+				Postings: make([]Posting, 0, PostingsChunkSize),
+			}
+		}
+
+		newPosting := Posting{DocID: docID, TF: float64(count)}
+
+		if len(currentChunk.Postings) >= PostingsChunkSize {
+			chunkCount++
+			var buf [4]byte
+			binary.BigEndian.PutUint32(buf[:], chunkCount)
+			_ = ie.DB.Write(IndexPageID, txn, metaKey, buf[:], 0)
+
+			targetChunkKey = []byte(fmt.Sprintf("term:%s:chunk:%d", term, chunkCount-1))
+			currentChunk = PostingsChunk{
+				ChunkID:  chunkCount - 1,
+				Postings: []Posting{newPosting},
+			}
+		} else {
+			currentChunk.Postings = append(currentChunk.Postings, newPosting)
+		}
+
+		updatedData, _ := json.Marshal(currentChunk)
+		if err := ie.DB.Write(IndexPageID, txn, targetChunkKey, updatedData, 0); err != nil {
+			return err
+		}
+	}
+
+	ie.mu.Lock()
+	prevDocs := ie.TotalDocs
+	ie.TotalDocs++
+	ie.AvgDocLen = ((ie.AvgDocLen * float64(prevDocs)) + float64(len(tokens))) / float64(ie.TotalDocs)
+	state := EngineState{TotalDocs: ie.TotalDocs, AvgDocLen: ie.AvgDocLen}
+	stateBytes, _ := json.Marshal(state)
+	_ = ie.DB.Write(MetadataPageID, txn, []byte("bm25_state"), stateBytes, 0)
+	ie.mu.Unlock()
+
+	return nil
 }
 
 func (ie *IntegratedEngine) LocalSearch(queryText string, limit int) ([]SearchResult, error) {
@@ -193,17 +296,12 @@ func (ie *IntegratedEngine) LocalSearch(queryText string, limit int) ([]SearchRe
 			continue
 		}
 
-		numerator := float64(totalDocs-postingsCount) + 0.5
-		denominator := float64(postingsCount) + 0.5
-		idf := math.Log(1.0 + (numerator / denominator))
-
 		for _, p := range matches {
 			if !validDocs[p.DocID] {
 				continue
 			}
-			lNorm := 1.0 - ie.b + ie.b*(avgDocLen/avgDocLen)
-			tfNorm := (p.TF * (ie.k1 + 1.0)) / (p.TF + ie.k1*lNorm)
-			docScores[p.DocID] += idf * tfNorm
+			score := ie.Scorer.Score(p.TF, avgDocLen, avgDocLen, totalDocs, postingsCount)
+			docScores[p.DocID] += score
 		}
 	}
 
@@ -255,12 +353,9 @@ func (ie *IntegratedEngine) evaluateAST(q Query, txn uint64) map[string]bool {
 }
 
 func (ie *IntegratedEngine) ScatterGather(ctx context.Context, subjectID []byte, queryText string, limit int) ([]SearchResult, error) {
-	// 1. Core Interception: Use the abstract interface to perform authentication checks inline
 	if ie.Interceptor != nil {
 		if !ie.Interceptor.VerifyAccess(subjectID, "SEARCH", "audit_logs") {
-			if ie.Interceptor != nil {
-				ie.Interceptor.LogAudit(string(subjectID), "SEARCH_DENIED", "ABAC validation failure on distributed search request")
-			}
+			ie.Interceptor.LogAudit(string(subjectID), "SEARCH_DENIED", "ABAC validation failure on distributed search request")
 			return nil, fmt.Errorf("security policy validation failure: search access denied")
 		}
 	}
@@ -270,7 +365,6 @@ func (ie *IntegratedEngine) ScatterGather(ctx context.Context, subjectID []byte,
 		return nil, err
 	}
 
-	// 2. Network Fan-Out via Injected Transport Layer
 	if ie.Transport == nil {
 		return localHits, nil
 	}

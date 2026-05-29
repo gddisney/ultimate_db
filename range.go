@@ -2,18 +2,17 @@ package ultimate_db
 
 import (
 	"bytes"
-	"fmt"
 )
 
 // RangeCursor handles safe, page-crossing sequential iteration tracking
 type RangeCursor struct {
-	db        *DB
-	txnID     uint64
-	pageID    PageID
-	startKey  []byte
-	endKey    []byte
+	db         *DB
+	txnID      uint64
+	pageID     PageID
+	startKey   []byte
+	endKey     []byte
 	currentKey []byte
-	exhausted bool
+	exhausted  bool
 }
 
 // NewRangeCursor initializes a bounded iteration scanner over a specific page matrix
@@ -36,23 +35,20 @@ func (rc *RangeCursor) Next() ([]byte, []byte, error) {
 	var foundKey, foundValue []byte
 	var stepErr error
 
-	// Scan compressed pages sequentially starting from our last tracked key boundary
-	stepErr = rc.db.ScanCompressed(rc.pageID, rc.txnID, rc.startKey, func(key, value []byte) bool {
-		// If we've already evaluated this key in a prior Next() cycle, keep moving forward
+	// FIXED: Direct call to raw db.Scan to bypass the nil Codec translation layer completely
+	stepErr = rc.db.Scan(rc.pageID, rc.txnID, rc.startKey, func(key, value []byte) bool {
 		if rc.currentKey != nil && bytes.Compare(key, rc.currentKey) <= 0 {
 			return true
 		}
 
-		// Ensure we haven't broken past our upper range boundary constraint
 		if rc.endKey != nil && bytes.Compare(key, rc.endKey) > 0 {
 			rc.exhausted = true
-			return false // Abort scan loop
+			return false 
 		}
 
-		// Capture the isolated key/value slice values
 		foundKey = append([]byte(nil), key...)
 		foundValue = append([]byte(nil), value...)
-		return false // Break out of this page iteration to hand control back to caller
+		return false 
 	})
 
 	if stepErr != nil {
@@ -64,7 +60,6 @@ func (rc *RangeCursor) Next() ([]byte, []byte, error) {
 		return nil, nil, nil
 	}
 
-	// Update our state machine tracking registers to avoid infinite processing cycles
 	rc.currentKey = foundKey
 	rc.startKey = foundKey
 
