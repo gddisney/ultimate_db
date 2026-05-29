@@ -1,7 +1,3 @@
-Here is the comprehensive, production-ready `README.md` for `ultimate_db`. This documentation fully specifies the custom GML-aligned data model, query AST primitives, storage layout mechanics, and the lock-free high-speed MVCC memory architecture running under the hood.
-
----
-
 # ultimate_db (v2.0)
 
 A high-performance, embedded transactional storage engine engineered in Go. `ultimate_db` features a bimodal architecture pairing a slot-page B+ Tree storage engine with a lock-free Optimistic Concurrency Control (OCC) fast memory cache. It is designed specifically to back high-velocity, distributed zero-trust mesh layers and real-time security analytics engines with near-flat operating overhead.
