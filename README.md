@@ -1,6 +1,3 @@
-This is a robust foundation for a production-ready database engine. Below is a structured `README.md` that captures the technical architecture, capabilities, and setup for your system.
-
----
 
 # UltimateDB (UDB)
 
