@@ -80,4 +80,4 @@ Designed for low-latency retrieval, UDB achieves full pipeline integration (CRUD
 
 ## License
 
-Confidential - Proprietary Database Engine for [Your Startup Name] Infrastructure.
+MIT
