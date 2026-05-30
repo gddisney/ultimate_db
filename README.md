@@ -39,8 +39,7 @@ The built-in ORM uses Go reflection to map structs directly to physical storage.
 Add UDB to your Go project:
 
 ```bash
-# Assuming local development for your startup pipeline
-import "ultimate_db"
+import "github.com/gddisney/ultimate_db"
 
 ```
 
