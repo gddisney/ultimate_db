@@ -1,3 +1,3 @@
-module github.com/gddisney/ultimate_db
+module github.com/OTrustCloud/ultimate_db
 
 go 1.23.3
